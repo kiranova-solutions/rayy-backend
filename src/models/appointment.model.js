@@ -84,6 +84,12 @@ const appointmentSchema = new mongoose.Schema(
       type: [mongoose.Schema.Types.ObjectId],
       default: [],
     },
+    eventId: {
+      type: String,
+    },
+    paymentScreenshotUrl: {
+      type: String,
+    },
   },
   { timestamps: true }
 );

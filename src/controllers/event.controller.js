@@ -3,6 +3,8 @@ const { sendEventDeletionNotification } = require("../services/notification.serv
 const Service = require("../models/service.model");
 const User = require("../models/user.model");
 const Store = require("../models/store.model");
+const { copy } = require("../routes/event.route");
+const Appointment = require("../models/appointment.model"); 
 
 
 const timeToMinutes = (timeString) => {
@@ -186,7 +188,7 @@ const createEvent = async (req, res) => {
       eventPrice,
       isPaid,
       paymentCollection,
-      attendees: [], // Initialize empty attendees array
+      // Note: attendees are now tracked via Appointment model
       location: vendorDetails?.location,
       vendor: userId,
       images: images,
@@ -408,10 +410,13 @@ const updateEvent = async (req, res) => {
       validationErrors.push("Number of attendees must be a positive number");
     }
 
-    // Check if reducing numberOfAttendees would affect existing attendees
-    const currentAttendees = existingEvent.attendees.length;
-    if (numberOfAttendees < currentAttendees) {
-      validationErrors.push(`Cannot reduce number of attendees below current registrations (${currentAttendees})`);
+    // Check if reducing numberOfAttendees would affect existing appointments
+    const currentConfirmedAppointments = await Appointment.countDocuments({
+      eventId: eventId,
+      status: { $in: ["Confirmed", "Completed"] }
+    });
+    if (numberOfAttendees < currentConfirmedAppointments) {
+      validationErrors.push(`Cannot reduce number of attendees below current confirmed registrations (${currentConfirmedAppointments})`);
     }
 
     if(isPaid) {
@@ -550,19 +555,24 @@ const deleteEvent = async (req, res) => {
       });
     }
 
-    // Store event details and attendees for notifications before deletion
+    // Store event details and get appointments for notifications before deletion
     const eventName = event.name;
     const startDate = event.startDate;
-    const attendees = event.attendees;
     const eventVendorId = event.vendor;
+
+    // Get all appointments for this event before deletion
+    const appointments = await Appointment.find({
+      eventId: eventId,
+      status: { $ne: "Cancelled" }
+    });
 
     // Delete the event
     await Event.findByIdAndDelete(eventId);
 
     // Send notifications to all attendees about event deletion
-    if (attendees && attendees.length > 0) {
-      const notificationPromises = attendees.map(attendee => 
-        sendEventDeletionNotification(attendee.clientId, {
+    if (appointments && appointments.length > 0) {
+      const notificationPromises = appointments.map(appointment => 
+        sendEventDeletionNotification(appointment.clientId, {
           eventName,
           startDate,
           vendorId: eventVendorId,
@@ -579,7 +589,7 @@ const deleteEvent = async (req, res) => {
       message: "Event deleted successfully",
       data: {
         deletedEventId: eventId,
-        notificationsSent: attendees.length,
+        notificationsSent: appointments.length,
       },
     });
 
@@ -614,16 +624,19 @@ const getOngoingEventsByVendor = async (req, res) => {
     const ongoingEvents = await Event.find({
       vendor: vendorId,
       endDate: { $gt: currentDateTime },
-    }).select('_id name numberOfAttendees attendees images endDate');
-
+    }).select('_id name numberOfAttendees images endDate');
 
     console.log('ongoingEvents', ongoingEvents)
 
     // Transform the data to include only required fields
-    const formattedEvents = ongoingEvents.map(event => {
-      // Calculate available slots
+    const formattedEvents = await Promise.all(ongoingEvents.map(async (event) => {
+      // Calculate available slots using appointments
       const totalSlots = event.numberOfAttendees;
-      const occupiedSlots = event.attendees ? event.attendees.length : 0;
+      const confirmedAppointments = await Appointment.countDocuments({
+        eventId: event._id,
+        status: { $in: ["Confirmed", "Completed"] }
+      });
+      const occupiedSlots = confirmedAppointments;
       const availableSlots = Math.max(0, totalSlots - occupiedSlots);
 
       // Get the first image or null if no images
@@ -637,7 +650,7 @@ const getOngoingEventsByVendor = async (req, res) => {
         totalSlots: totalSlots,
         image: image,
       };
-    });
+    }));
 
     return res.status(200).json({
       success: true,
@@ -691,10 +704,17 @@ const getEventById = async (req, res) => {
       });
     }
 
-    // Calculate available slots
+    // Calculate available slots using appointments
     const totalSlots = event.numberOfAttendees;
-    const occupiedSlots = event.attendees ? event.attendees.length : 0;
+    const confirmedAppointments = await Appointment.countDocuments({
+      eventId: event._id,
+      status: { $in: ["Confirmed", "Completed"] }
+    });
+    const occupiedSlots = confirmedAppointments;
     const availableSlots = Math.max(0, totalSlots - occupiedSlots);
+
+    // Get all appointments for this event
+    const appointments = await Appointment.find({ eventId: event._id });
 
     // Format the response with additional computed fields
     const eventDetails = {
@@ -716,7 +736,7 @@ const getEventById = async (req, res) => {
       vendorId: event.vendorId,
       isPaid: event.isPaid,
       paymentCollection: event.paymentCollection,
-      attendees: event.attendees,
+      attendees: appointments,
       createdAt: event.createdAt,
       updatedAt: event.updatedAt,
       isFull: availableSlots === 0,
@@ -761,7 +781,7 @@ const getUpcomingEventsForUser = async (req, res) => {
 
     let query = Event.find({
       endDate: { $gt: currentDate }, // Check if event hasn't ended yet
-    }).select('_id name startDate endDate startTime endTime numberOfAttendees attendees images eventPrice isPaid vendor details')
+    }).select('_id name startDate endDate startTime endTime numberOfAttendees images eventPrice isPaid vendor details rating')
     .populate('vendor', 'name email') // Populate vendor information 
     .sort({ startDate: 1 }); // Sort by start date ascending
 
@@ -775,10 +795,14 @@ const getUpcomingEventsForUser = async (req, res) => {
     console.log('upcomingEvents', upcomingEvents);
 
     // Transform the data to include only required fields with additional computed data
-    const formattedEvents = upcomingEvents.map(event => {
-      // Calculate available slots
+    const formattedEvents = await Promise.all(upcomingEvents.map(async (event) => {
+      // Calculate available slots using appointments
       const totalSlots = event.numberOfAttendees;
-      const occupiedSlots = event.attendees ? event.attendees.length : 0;
+      const confirmedAppointments = await Appointment.countDocuments({
+        eventId: event._id,
+        status: { $in: ["Confirmed", "Completed"] }
+      });
+      const occupiedSlots = confirmedAppointments;
       const availableSlots = Math.max(0, totalSlots - occupiedSlots);
 
       // Get the first image or null if no images
@@ -798,6 +822,7 @@ const getUpcomingEventsForUser = async (req, res) => {
         eventPrice: event.eventPrice,
         isPaid: event.isPaid,
         image: image,
+        rating: event.rating,
         vendor: {
           id: event.vendor._id,
           name: event.vendor.name,
@@ -805,7 +830,7 @@ const getUpcomingEventsForUser = async (req, res) => {
         },
         isFull: availableSlots === 0,
       };
-    });
+    }));
 
     return res.status(200).json({
       success: true,
@@ -861,7 +886,20 @@ const getEventInfo = async (req, res) => {
 
     console.log('event', event)
 
-    const isFull = event.attendees.map(attendee => attendee.status === "approved").length >= event.numberOfAttendees;
+    // Get appointments to check if event is full and if user is booked
+    const confirmedAppointments = await Appointment.countDocuments({
+      eventId: event._id,
+      status: { $in: ["Confirmed", "Completed"] }
+    });
+    const isFull = confirmedAppointments >= event.numberOfAttendees;
+
+    // Check if current user has an appointment for this event
+    const userAppointment = await Appointment.findOne({
+      eventId: event._id,
+      clientId: userId,
+      status: { $ne: "Cancelled" }
+    });
+    const isBooked = !!userAppointment;
 
     // Format the response with exactly the requested fields
     const eventInfo = {
@@ -879,7 +917,7 @@ const getEventInfo = async (req, res) => {
       eventDescription: event.details,
       services: services || [],
       isPaid : event.isPaid,
-      isBooked : event.attendees.some(attendee => attendee.clientId === userId),
+      isBooked : isBooked,
       startTime : event.startTime,
       isFull : isFull,
       endTime : event.endTime,
@@ -952,8 +990,13 @@ const confirmBooking = async (req, res) => {
     console.log('userDetails', userDetails)
     const isVendor = userDetails?.type === "Vendor" || userDetails?.type === "Owner" || false ;
 
-    // Check if event is full
-    if (event.attendees.length >= event.numberOfAttendees) {
+
+    const confirmedAppointmentCount = await Appointment.countDocuments({
+      eventId: eventId,
+      status: "Confirmed"
+    });
+    
+    if (confirmedAppointmentCount >= event.numberOfAttendees) {
       console.log('event is full')
       return res.status(400).json({
         success: false,
@@ -961,10 +1004,14 @@ const confirmBooking = async (req, res) => {
       });
     }
 
-    // Check if user is already registered for this event
-    const isAlreadyRegistered = event.attendees.some(attendee => attendee.clientId === userId);
-    console.log('isAlreadyRegistered', isAlreadyRegistered)
-    if (isAlreadyRegistered) {
+    // Check if user is already registered for this event by checking appointments
+    const existingAppointment = await Appointment.findOne({
+      eventId: eventId,
+      clientId: userId,
+      status: { $ne: "Cancelled" } 
+    });
+    
+    if (existingAppointment) {
       return res.status(400).json({
         success: false,
         message: "User is already registered for this event",
@@ -980,25 +1027,8 @@ const confirmBooking = async (req, res) => {
     //   });
     // }
 
-    // Get registration field configuration
-    const registrationFields = event.registrationFieldConfig
-
-   if(registrationFields) {
-    // Validate registration data based on event configuration
-    const validationResult = event.validateRegistrationData(registrationFields || {});
-    
-    if (!validationResult.isValid) {
-      return res.status(400).json({
-        success: false,
-        message: "Registration validation failed",
-        errors: validationResult.errors,
-      });
-    }
-  }
-
     // Check if payment screenshot is required
-    const paymentScreenshotConfig = event.registrationFieldConfig?.paymentScreenshot;
-    const isPaymentScreenshotRequired = paymentScreenshotConfig?.isRequired && paymentScreenshotConfig?.isEnabled;
+    const isPaymentScreenshotRequired = event.isPaid && event.paymentCollection === "preEvent";
     
     if (isPaymentScreenshotRequired && !paymentScreenshotUrl) {
       return res.status(400).json({
@@ -1007,21 +1037,36 @@ const confirmBooking = async (req, res) => {
       });
     }
 
-    const newAttendee = {
+    const client = await User.findById(userId);
+    
+    const appointmentData = {
+      appointmentDate: event.startDate,
+      appointmentStartTime: event.startTime,
+      appointmentEndTime: event.endTime,
+      clientName: client?.fullName,
+      clientPhone: client?.phone,
+      clientEmail: client?.email,
       clientId: userId,
-      registeredAt: new Date(),
-      status: "pending",
+      vendorId: event.vendor.toString(),
+      service: null, // Events don't have services
+      createdBy: userId,
+      status: "Created", // Initial status - vendor can approve/deny later
+      userType: "Client",
+      eventId: eventId,
+      paymentScreenshotUrl: paymentScreenshotUrl,
     };
 
-    // Add payment screenshot URL if provided
-    if (paymentScreenshotUrl) {
-      newAttendee.paymentScreenshotUrl = paymentScreenshotUrl;
-    }
+    const appointment = new Appointment(appointmentData);
+    await appointment.save();
 
-    event.attendees.push(newAttendee);
-    await event.save();
+    console.log('Appointment created for event booking:', appointment.bookingId);
 
-    const availableSlots = event.numberOfAttendees - event.attendees.length;
+    // Update availableSlots calculation based on confirmed appointments
+    const currentConfirmedAppointments = await Appointment.countDocuments({
+      eventId: eventId,
+      status: "Confirmed"
+    });
+    const availableSlots = event.numberOfAttendees - currentConfirmedAppointments;
 
     return res.status(200).json({
       success: true,
@@ -1030,8 +1075,11 @@ const confirmBooking = async (req, res) => {
         eventId: event._id,
         eventName: event.name,
         userId: userId,
-        registeredAt: newAttendee.registeredAt,
-        totalAttendees: event.attendees.length,
+        bookingId: appointment.bookingId,
+        appointmentId: appointment._id,
+        registeredAt: appointment.createdAt,
+        appointmentStatus: appointment.status,
+        totalAttendees: currentConfirmedAppointments,
         availableSlots: availableSlots,
         isFull: availableSlots === 0,
         isVendor: isVendor,
@@ -1090,14 +1138,35 @@ const getEventBookingStats = async (req, res) => {
       });
     }
 
-    // Get all attendees
-    const attendees = event.attendees || [];
+    // Get all appointments for this event
+    const appointments = await Appointment.find({ eventId: eventId });
+
+    // Map appointment status to desired format
+    const mapAppointmentStatus = (appointmentStatus) => {
+      switch (appointmentStatus) {
+        case "Confirmed":
+        case "Completed":
+          return "approved";
+        case "Created":
+          return "pending";
+        case "Cancelled":
+          return "denied";
+        default:
+          return "pending";
+      }
+    };
 
     // Calculate statistics
     const total = event.numberOfAttendees;
-    const approved = attendees.filter(attendee => attendee.status === "approved").length;
-    const pending = attendees.filter(attendee => attendee.status === "pending").length;
-    const denied = attendees.filter(attendee => attendee.status === "denied").length;
+    const approved = appointments.filter(appointment => 
+      mapAppointmentStatus(appointment.status) === "approved"
+    ).length;
+    const pending = appointments.filter(appointment => 
+      mapAppointmentStatus(appointment.status) === "pending"
+    ).length;
+    const denied = appointments.filter(appointment => 
+      mapAppointmentStatus(appointment.status) === "denied"
+    ).length;
 
     const stats = {
       total: total,
@@ -1107,10 +1176,9 @@ const getEventBookingStats = async (req, res) => {
       denied: denied,
     };
 
-    // Get user details for each attendee
-    const userIds = attendees.map(attendee => attendee.clientId);
+    // Get user details for each appointment
+    const userIds = appointments.map(appointment => appointment.clientId);
     const users = await User.find({ _id: { $in: userIds } }).select('_id fullName profileImage email gender age phone');
-
 
     console.log('users', users)
 
@@ -1119,29 +1187,27 @@ const getEventBookingStats = async (req, res) => {
       userMap[user._id] = user;
     });
 
-    const usersData = attendees.map(attendee => {
-      const user = userMap[attendee.clientId];
+    const usersData = appointments.map(appointment => {
+      const user = userMap[appointment.clientId];
       
-      const formattedDate = new Date(attendee.registeredAt).toLocaleDateString('en-GB', {
+      const formattedDate = new Date(appointment.createdAt).toLocaleDateString('en-GB', {
         day: '2-digit',
         month: 'short',
         year: '2-digit'
       });
 
       return {
-        id: attendee.clientId,
+        id: appointment.clientId,
         name: user?.fullName || null,
         profileImage: user?.profileImage || null,
         mobile: user?.phone || null, 
         age: user?.age || null,
         gender : user?.gender || null,
         date: formattedDate,
-        status: attendee.status.toUpperCase(),
-        paymentScreenshotUrl: attendee.paymentScreenshotUrl || null,
+        status: mapAppointmentStatus(appointment.status).toUpperCase(),
+        paymentScreenshotUrl: appointment.paymentScreenshotUrl, 
       };
     });
-
-    
 
     const payment = {
       isPaid : event.isPaid,
@@ -1193,24 +1259,49 @@ const confirmAttendee = async (req, res) => {
     if(!eventId || !clientId) {
       return res.status(400).json({
         success: false,
-        message: "Event ID, User ID, and Client ID are required",
+        message: "Event ID and Client ID are required",
       });
     }
 
-    const event = await Event.findById(eventId);
+    // Find the existing appointment for this event and client
+    const appointment = await Appointment.findOne({
+      eventId: eventId,
+      clientId: clientId
+    });
 
-    const attendee = event.attendees.find(attendee => attendee.clientId === clientId);
-
-    if(attendee.status === "approved") {
-      throw new Error("Attendee is already approved");
+    if (!appointment) {
+      return res.status(404).json({
+        success: false,
+        message: "Appointment not found for this event and client",
+      });
     }
 
-    attendee.status = status;  
-    await event.save(); 
+    if (appointment.status === "Confirmed") {
+      return res.status(400).json({
+        success: false,
+        message: "Attendee is already approved",
+      });
+    }
+
+    // Update appointment status based on the decision
+    if (status === "approved") {
+      appointment.status = "Confirmed";
+      appointment.confirmedAt = new Date();
+    } else if (status === "denied") {
+      appointment.status = "Cancelled";
+      appointment.cancelledAt = new Date();
+      appointment.cancellationReason = "Denied by vendor";
+    }
+
+    await appointment.save();
+
+    const statusMessage = status === "approved" ? "approved" : "denied";
+    console.log(`Appointment ${statusMessage} for event attendee:`, appointment.bookingId);
 
     return res.status(200).json({
       success: true,
-      message: "Attendee approved successfully",
+      message: `Attendee ${statusMessage} successfully`,
+      appointment
     }); 
 
   } catch (error) {

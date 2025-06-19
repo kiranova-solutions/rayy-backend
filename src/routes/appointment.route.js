@@ -15,7 +15,8 @@ const {
   getAppointmentsForBigCalendar,
   getAppointmentsByStaffId,
   changeSlot,
-  getLatestCompletedAppointment
+  getLatestCompletedAppointment,
+  cancelEvent
 } = require("../controllers/appointment.controller");
 const authMiddleware = require("../middlewares/authMiddleware");
 
@@ -29,6 +30,9 @@ router.put("/updateSlot", authMiddleware, changeSlot);
 
 // Cancel Appointment
 router.put("/cancelAppointment", authMiddleware, cancelAppointment);
+
+// Cancel Event
+router.put("/cancelEvent", authMiddleware, cancelEvent);
 
 // Confirm Appointment
 router.put("/confirmAppointment/:id", authMiddleware, confirmAppointment);

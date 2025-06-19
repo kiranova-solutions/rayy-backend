@@ -6,6 +6,7 @@ const Service = require("../models/service.model");
 const Cart = require("../models/cart.model");
 const Rating = require("../models/rating.model");
 const User = require("../models/user.model");
+const Event = require("../models/event.model");
 const moment = require("moment");
 const userService = require("../services/user.service");
 const {
@@ -665,14 +666,22 @@ const getAppointments = async (req, res) => {
     // Fetch all appointments for the logged-in user
     const userId = req.userId;
 
+    console.log('userId', userId)
+
     // Check if the user is a client (createdBy) or a vendor (vendorId)
     const appointments = await Appointment.find({
       $or: [{ createdBy: userId }, { vendorId: userId }],
     });
 
-    // Iterate through each appointment and fetch additional details
+    console.log('appointments', appointments)
+
+    // Separate event appointments from regular appointments
+    const eventAppointments = appointments.filter(appointment => appointment.eventId);
+    const regularAppointments = appointments.filter(appointment => !appointment.eventId);
+
+    // Process regular appointments
     const appointmentsWithDetails = await Promise.all(
-      appointments.map(async (appointment) => {
+      regularAppointments.map(async (appointment) => {
         const service = await Service.findOne({ _id: appointment.service });
         const staff = await Staff.findOne({ _id: appointment.staff });
         const rating = await Rating.findOne({ appointmentId: appointment._id });
@@ -683,15 +692,46 @@ const getAppointments = async (req, res) => {
           serviceName: service ? service.name : null,
           serviceDetails: service,
           staffName: staff?.name,
-          rating: rating ? rating : null, // Assuming rating has a `value` field
+          rating: rating ? rating : null,
           client,
         };
       })
     );
 
-    res
-      .status(200)
-      .json({ success: true, appointments: appointmentsWithDetails });
+    // Process event appointments
+    const eventsWithDetails = await Promise.all(
+      eventAppointments.map(async (appointment) => {
+        const event = await Event.findOne({ _id: appointment.eventId });
+        const vendor = await User.findOne({ _id: event?.vendor });
+        const client = await User.findOne({ _id: appointment.clientId });
+
+        return {
+          ...appointment._doc,
+          eventDetails: {
+            _id: event?._id,
+            name: event?.name,
+            images: event?.images || [],
+            startDate: event?.startDate,
+            endDate: event?.endDate,
+            startTime: event?.startTime,
+            endTime: event?.endTime,
+            price: event?.eventPrice,
+            vendorName: vendor?.fullName || vendor?.companyName,
+            location: event?.location,
+            serviceDetails: event?.serviceDetails,
+            paymentCollection: event?.paymentCollection,
+            isPaid: event?.isPaid,
+          },
+          client,
+        };
+      })
+    );
+
+    res.status(200).json({ 
+      success: true, 
+      appointments: appointmentsWithDetails,
+      events: eventsWithDetails
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -1366,6 +1406,137 @@ const getLatestCompletedAppointment = async (req, res) => {
   }
 };
 
+const cancelEvent = async (req, res) => {
+  try {
+    const { eventId, cancellationReason, cancellationDescription, userId } = req.body;
+
+    if (!eventId) {
+      return res.status(400).json({
+        success: false,
+        message: "Event ID is required",
+      });
+    }
+
+    // Find the event
+    const event = await Event.findById(eventId);
+
+    if (!event) {
+      return res.status(404).json({
+        success: false,
+        message: "Event not found",
+      });
+    }
+
+    // Check if the user is authorized to cancel the event (vendor should be able to cancel their own events)
+    // if (event.clientId !== req.userId) {
+    //   console.log('event.clientId', event.clientId)
+    //   console.log('req.userId', req.userId)
+    //   return res.status(403).json({
+    //     success: false,
+    //     message: "You are not authorized to cancel this event",
+    //   });
+    // }
+
+    // Check if event has already started
+    const now = new Date();
+    const eventStartDate = new Date(event.startDate);
+    
+    if (eventStartDate <= now) {
+      console.log('eventStartDate', eventStartDate)
+      console.log('now', now)
+      return res.status(400).json({
+        success: false,
+        message: "Cannot cancel an event that has already started",
+      });
+    }
+
+    // Find all appointments related to this event
+    const eventAppointments = await Appointment.find({
+      eventId: eventId,
+      clientId: userId,
+      status: { $nin: ["Cancelled", "Completed"] } // Only cancel active appointments
+    });
+
+    // Update all event appointments to cancelled status
+    const appointmentUpdates = eventAppointments.map(async (appointment) => {
+      appointment.status = "Cancelled";
+      appointment.cancellationReason = cancellationReason;
+      appointment.cancellationDescription = cancellationDescription;
+      appointment.cancelledAt = new Date();
+      
+      await appointment.save();
+
+      // Send notification to each client who had an appointment for this event
+      // try {
+      //   const client = await User.findById(appointment.clientId);
+      //   if (client && client.email) {
+      //     const appointmentDetails = {
+      //       bookingId: appointment.bookingId,
+      //       eventName: event.name,
+      //       appointmentDate: appointment.appointmentDate,
+      //       appointmentStartTime: appointment.appointmentStartTime,
+      //       appointmentEndTime: appointment.appointmentEndTime,
+      //       location: event.location,
+      //       cancellationReason,
+      //       cancellationDescription,
+      //     };
+          
+      //     // Send email notification using existing service
+      //     await userService.sendEmailOnCancel(
+      //       client.email,
+      //       event.name, // Using event name as store name
+      //       appointmentDetails
+      //     );
+
+      //     // Send SMS notification
+      //     await bookingCancelledSMS({
+      //       recipientNumber: client.phone,
+      //       var1: appointment.bookingId,
+      //       var2: new Date(appointment.appointmentDate).toISOString().split("T")[0],
+      //       var3: appointment.appointmentStartTime,
+      //       var4: event.name,
+      //     });
+
+      //     // Send push notification
+      //     await sendAppointmentStatusNotification(
+      //       appointment.clientId,
+      //       appointment,
+      //       "Cancelled"
+      //     );
+
+      //     console.log(`Cancellation notifications sent to ${client.email} for event ${event.name}`);
+      //   }
+      // } catch (error) {
+      //   console.error(`Error notifying client ${appointment.clientId}:`, error);
+      // }
+
+      return appointment;
+    });
+
+    const updatedAppointments = await Promise.all(appointmentUpdates);
+    console.log('updatedAppointments', updatedAppointments)
+
+    // Update event status if needed (you might want to add a status field to Event model)
+    // event.status = "Cancelled";
+    // event.cancelledAt = new Date();
+    // await event.save();
+
+    res.status(200).json({
+      success: true,
+      message: `Event cancelled successfully. ${updatedAppointments.length} appointments were cancelled.`,
+      event,
+      cancelledAppointments: updatedAppointments.length,
+    });
+  } catch (error) {
+    console.error("Error cancelling event:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to cancel event",
+      error: error.message,
+    });
+  }
+};
+
 module.exports = {
   createAppointment,
   getAppointments,
@@ -1381,4 +1552,5 @@ module.exports = {
   getAppointmentsForBigCalendar,
   changeSlot,
   getLatestCompletedAppointment,
+  cancelEvent,
 };
