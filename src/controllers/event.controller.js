@@ -1109,7 +1109,10 @@ const getEventBookingStats = async (req, res) => {
 
     // Get user details for each attendee
     const userIds = attendees.map(attendee => attendee.clientId);
-    const users = await User.find({ _id: { $in: userIds } }).select('_id fullName profileImage email');
+    const users = await User.find({ _id: { $in: userIds } }).select('_id fullName profileImage email gender age phone');
+
+
+    console.log('users', users)
 
     const userMap = {};
     users.forEach(user => {
@@ -1129,7 +1132,7 @@ const getEventBookingStats = async (req, res) => {
         id: attendee.clientId,
         name: user?.fullName || null,
         profileImage: user?.profileImage || null,
-        mobile: user?.mobile || null, 
+        mobile: user?.phone || null, 
         age: user?.age || null,
         gender : user?.gender || null,
         date: formattedDate,
@@ -1137,6 +1140,8 @@ const getEventBookingStats = async (req, res) => {
         paymentScreenshotUrl: attendee.paymentScreenshotUrl || null,
       };
     });
+
+    
 
     const payment = {
       isPaid : event.isPaid,
@@ -1176,7 +1181,14 @@ const getEventBookingStats = async (req, res) => {
 
 const confirmAttendee = async (req, res) => {
   try {
-    const { eventId, clientId } = req.body;
+    const { eventId, clientId, status } = req.body;
+
+    if(!["approved", "denied"].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid status",
+      });
+    }
 
     if(!eventId || !clientId) {
       return res.status(400).json({
@@ -1193,7 +1205,7 @@ const confirmAttendee = async (req, res) => {
       throw new Error("Attendee is already approved");
     }
 
-    attendee.status = "approved";  
+    attendee.status = status;  
     await event.save(); 
 
     return res.status(200).json({

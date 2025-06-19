@@ -40,7 +40,7 @@ const appointmentSchema = new mongoose.Schema(
     },
     service: {
       type: mongoose.Schema.Types.ObjectId,
-      required: true,
+
     },
     staff: {
       type: String,
